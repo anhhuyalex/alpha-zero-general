@@ -63,7 +63,8 @@ argparser.add_argument('--mod_p', default=3, type=int)
 args = argparser.parse_args()
 EPS = 1e-8
 
-@ray.remote(num_gpus=0.1)
+# ./.venv/bin/python main.py --numEps 10
+@ray.remote(num_cpus = 0.1, num_gpus=0.1 if args.cuda == True else 0, concurrency_groups={"execute": 16})
 class Self_play:
     def __init__(self, policy, game, nnet, args):
         self.policy = policy
@@ -72,6 +73,7 @@ class Self_play:
         self.args = args 
         self.mcts = MCTS(self.game, self.nnet, self.args)
 
+    @ray.method(concurrency_group="execute")
     def executeEpisode(self):
         """
         This function executes one episode of self-play, starting with player 1.
@@ -212,13 +214,14 @@ class BraidGame():
             next_garside_len: length of the braid after applying action
         """
         try:
+            board = copy.deepcopy(board)
             product_matrix_so_far = polymat.trim(board)
             product_matrix_so_far = polymat.trim(polymat.mul(product_matrix_so_far, self.gen_lookup_table[action])) 
             product_matrix_so_far = np.mod(product_matrix_so_far, args.mod_p)
             # print ("product_matrix_so_far", polymat.trim(board), product_matrix_so_far, product_matrix_so_far.shape, polymat.trim(product_matrix_so_far))
             return self.getCanonicalForm(product_matrix_so_far, None), cur_garside_len + 1, polymat.projlen(product_matrix_so_far)
         except:
-            return self.getCanonicalForm(board, None), cur_garside_len, 1e3
+            return self.getCanonicalForm(board, None), cur_garside_len + 1, 1e3
 
     def transform_normalize_reward(self, projlen):
         """
@@ -544,17 +547,20 @@ class MCTS():
         """
 
         s = self.game.stringRepresentation(canonicalBoard)
+        
+        if self.game.getGameEnded(cur_garside_len) != 0:
+            # terminal node 
+            print ("terminal node", s)
+            if s not in self.Es:
+                _, v = self.nnet.predict(canonicalBoard)
+                self.Es[s] = v
 
-        if s not in self.Es:
-            self.Es[s] = self.game.getGameEnded(cur_garside_len)
-        if self.Es[s] != 0:
-            # terminal node
-            return -self.Es[s]
+            return self.Es[s]
 
         if s not in self.Ps:
             # leaf node 
-            self.Ps[s], v = self.nnet.predict(canonicalBoard)
-            
+            self.Ps[s], self.Es[s] = self.nnet.predict(canonicalBoard)
+            v = self.Es[s] # value of the leaf node
             valids = self.game.getValidMoves(last_action) 
             # print ("valids", valids)
             self.Ps[s] = self.Ps[s] * valids  # masking invalid moves
@@ -574,7 +580,8 @@ class MCTS():
 
             self.Vs[s] = valids
             self.Ns[s] = 0
-            return -v
+            return v
+
 
         valids = self.Vs[s]
         cur_best = -float('inf')
@@ -598,6 +605,7 @@ class MCTS():
         # print ("best_act", s, best_act)
         next_s, next_cur_garside_len, _ = self.game.getNextState(canonicalBoard, a, cur_garside_len)
         next_s = self.game.getCanonicalForm(next_s, next_cur_garside_len)
+        print ("recursion", cur_garside_len, s, self.game.stringRepresentation(next_s))
         v = self.search(next_s, next_cur_garside_len, a) # Search recursively
 
         if (s, a) in self.Qsa:
@@ -609,7 +617,7 @@ class MCTS():
             self.Nsa[(s, a)] = 1
 
         self.Ns[s] += 1 
-        return -v
+        return v
 
 class Coach():
     """
