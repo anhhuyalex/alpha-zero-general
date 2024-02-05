@@ -1,3 +1,9 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[ ]:
+
+
 import time
 import os
 import logging
@@ -28,30 +34,35 @@ import torch.optim
 # from othello.OthelloGame import OthelloGame as Game
 # from othello.pytorch.NNet import NNetWrapper as nn
 import NeuralNet
-from utils import *
+import utils 
 
 log = logging.getLogger(__name__)
 
 coloredlogs.install(level='INFO')  # Change this to DEBUG to see more info.
 
 # Start Ray.
-ray.init()
+ray.init(ignore_reinit_error=True)
  
 argparser = argparse.ArgumentParser()
 argparser.add_argument('--game', '-g', default='braid', choices=['braid']) 
 argparser.add_argument('--max_garside_len', default=100, type=int)
 argparser.add_argument('--maxpad_of_product_matrix', default=315, type=int)
-argparser.add_argument('--bias_canonical_form', default=-1.0, type=float)
-argparser.add_argument('--numIters', default=10, type=int)
-argparser.add_argument('--numEps', default=500, type=int)
-argparser.add_argument('--tempThreshold', default=100, type=int)
-argparser.add_argument('--updateThreshold', default=0.6, type=float)
+argparser.add_argument('--bias_symlog', default=4.5, type=float)
+argparser.add_argument('--playout_cap_randomization_prob', default=0.25, type=float)
+argparser.add_argument('--do_pretrain', action=argparse.BooleanOptionalAction, default=False)
+argparser.add_argument('--startIter', default=1, type=int)
+argparser.add_argument('--numIters', default=100, type=int)
+argparser.add_argument('--numEps', default=100, type=int)
+argparser.add_argument('--tempThreshold', default=200, type=int)
 argparser.add_argument('--maxlenOfQueue', default=200000, type=int)
-argparser.add_argument('--numMCTSSims', default=25, type=int)
-argparser.add_argument('--arenaCompare', default=40, type=int)
-argparser.add_argument('--cpuct', default=1.1, type=float)
-argparser.add_argument('--batch_size', default=128, type=int)
-argparser.add_argument('--epochs', default=1, type=int)
+argparser.add_argument('--num_jobs_at_a_time', default=5, type=int)
+argparser.add_argument('--nummaxMCTSSims', default=5, type=int)
+argparser.add_argument('--numminMCTSSims', default=1, type=int)
+argparser.add_argument('--cpuct', default=1.0, type=float)
+argparser.add_argument('--batch_size', default=256, type=int)
+argparser.add_argument('--epochs', default=10, type=int)
+argparser.add_argument('--pretrain_lr', default=2e-5, type=float)
+argparser.add_argument('--lr', default=6e-5, type=float)
 argparser.add_argument('--checkpoint', default='./temp/')
 argparser.add_argument('--load_model', default=False, type=bool)
 argparser.add_argument('--load_folder_file', default=('/dev/models/8x100x50','best.pth.tar'))
@@ -59,21 +70,30 @@ argparser.add_argument('--numItersForTrainExamplesHistory', default=20, type=int
 argparser.add_argument('--cuda', default=torch.cuda.is_available(), type=bool)
 argparser.add_argument('--dropout', default=0.0, type=float)
 argparser.add_argument('--mod_p', default=3, type=int)
+argparser.add_argument('--debug', action=argparse.BooleanOptionalAction, default=False)
 
-args = argparser.parse_args()
+if utils.is_interactive():
+    jupyter_args = "--numEps 1 --num_jobs_at_a_time 1 --do_pretrain --startIter 11" \
+            + " --epochs 1" 
+    args = argparser.parse_args(args=jupyter_args.split())
+else:
+    args = argparser.parse_args()
+
 EPS = 1e-8
 
-# ./.venv/bin/python main.py --numEps 10
-@ray.remote(num_cpus = 0.1, num_gpus=0.1 if args.cuda == True else 0, concurrency_groups={"execute": 16})
+# RAY_DEDUP_LOGS=0 ./.venv/bin/python main.py --numEps 10
+@ray.remote(num_gpus=0.2 if args.cuda == True else 0)
 class Self_play:
-    def __init__(self, policy, game, nnet, args):
+    def __init__(self, policy, game, nnet, nummaxMCTSSims, numminMCTSSims, args):
         self.policy = policy
         self.game = game
         self.nnet = nnet
+        self.nnet.set_eval_mode()
+        self.nummaxMCTSSims = nummaxMCTSSims
+        self.numminMCTSSims = numminMCTSSims
         self.args = args 
         self.mcts = MCTS(self.game, self.nnet, self.args)
 
-    @ray.method(concurrency_group="execute")
     def executeEpisode(self):
         """
         This function executes one episode of self-play, starting with player 1.
@@ -89,51 +109,92 @@ class Self_play:
             trainExamples: a list of examples of the form (canonicalBoard, currPlayer, pi,v)
                         pi is the MCTS informed policy vector, v is +1 if
                         the player eventually won the game, else -1.
+
+        0 [0. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 0.]
+        1 [0. 1. 0. 0. 1. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 1. 0. 0. 0. 0. 0.]
+        2 [0. 0. 1. 1. 0. 0. 0. 0. 0. 0. 0. 0. 1. 1. 0. 0. 1. 0. 0. 0. 0. 0. 0. 0.]
+        3 [0. 1. 0. 0. 1. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 1. 0. 0. 0. 0. 0.]
+        4 [0. 0. 1. 1. 0. 0. 0. 0. 0. 0. 0. 0. 1. 1. 0. 0. 1. 0. 0. 0. 0. 0. 0. 0.]
+        5 [0. 1. 1. 1. 1. 1. 0. 0. 0. 0. 0. 0. 1. 1. 0. 0. 1. 0. 1. 1. 0. 0. 1. 0.]
+        6 [0. 0. 0. 0. 0. 0. 1. 0. 1. 1. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0.]
+        7 [0. 1. 0. 0. 1. 0. 1. 1. 1. 1. 1. 1. 0. 0. 0. 0. 0. 0. 1. 0. 1. 1. 0. 0.]
+        8 [0. 0. 1. 1. 0. 0. 0. 0. 0. 0. 0. 0. 1. 1. 0. 0. 1. 0. 0. 0. 0. 0. 0. 0.]
+        9 [0. 1. 0. 0. 1. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 1. 0. 0. 0. 0. 0.]
+        10 [0. 0. 1. 1. 0. 0. 0. 0. 0. 0. 0. 0. 1. 1. 0. 0. 1. 0. 0. 0. 0. 0. 0. 0.]
+        11 [0. 1. 1. 1. 1. 1. 0. 0. 0. 0. 0. 0. 1. 1. 0. 0. 1. 0. 1. 1. 0. 0. 1. 0.]
+        12 [0. 0. 0. 0. 0. 0. 1. 0. 1. 1. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0.]
+        13 [0. 1. 0. 0. 1. 0. 1. 1. 1. 1. 1. 1. 0. 0. 0. 0. 0. 0. 1. 0. 1. 1. 0. 0.]
+        14 [0. 0. 1. 1. 0. 0. 1. 0. 1. 1. 0. 0. 1. 1. 1. 1. 1. 1. 0. 0. 0. 0. 0. 0.]
+        15 [0. 1. 0. 0. 1. 0. 1. 1. 1. 1. 1. 1. 0. 0. 0. 0. 0. 0. 1. 0. 1. 1. 0. 0.]
+        16 [0. 0. 1. 1. 0. 0. 0. 0. 0. 0. 0. 0. 1. 1. 0. 0. 1. 0. 0. 0. 0. 0. 0. 0.]
+        17 [0. 1. 1. 1. 1. 1. 0. 0. 0. 0. 0. 0. 1. 1. 0. 0. 1. 0. 1. 1. 0. 0. 1. 0.]
+        18 [0. 0. 0. 0. 0. 0. 1. 0. 1. 1. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0.]
+        19 [0. 1. 0. 0. 1. 0. 1. 1. 1. 1. 1. 1. 0. 0. 0. 0. 0. 0. 1. 0. 1. 1. 0. 0.]
+        20 [0. 0. 1. 1. 0. 0. 1. 0. 1. 1. 0. 0. 1. 1. 1. 1. 1. 1. 0. 0. 0. 0. 0. 0.]
+        21 [0. 1. 0. 0. 1. 0. 1. 1. 1. 1. 1. 1. 0. 0. 0. 0. 0. 0. 1. 0. 1. 1. 0. 0.]
+        22 [0. 0. 1. 1. 0. 0. 1. 0. 1. 1. 0. 0. 1. 1. 1. 1. 1. 1. 0. 0. 0. 0. 0. 0.]
+        23 [0. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 0.]
         """
         
-        trainExamples = []
+        
         board = self.game.getInitBoard()
+        trainExamples = []
         curPlayer = 1
         episodeStep = 0
 
         last_action = 0
         projlens = [1]
-        action_list = [0]
+        action_list = (0,)
         for cur_garside_len in range(self.game.getBoardSize() + 1):
-            episodeStep += 1
-            canonicalBoard = self.game.getCanonicalForm(board, curPlayer)
-            temp = int(episodeStep < args.tempThreshold)
-        
-            pi = self.mcts.getActionProb(canonicalBoard, cur_garside_len, last_action, temp=temp)
-            sym = self.game.getSymmetries(canonicalBoard, pi)
-            for b, p in sym:
-                trainExamples.append([b, p, None])
-            action = np.random.choice(len(pi), p=pi)
-                
             if self.game.getGameEnded(cur_garside_len):
                 best_projlen = np.inf
                 # reward is minimum projlen attained after applying the action
-                for i in range(len(trainExamples) - 2, -1, -1): 
+                # print ("trainExamples", len(trainExamples), "projlens", len(projlens), "action_list", len(action_list))
+                for i in range(len(trainExamples) - 1, -1, -1): 
                     x = trainExamples[i] 
-                    if projlens[i] < best_projlen:
-                        best_projlen = projlens[i]
+                    if projlens[x[2]] < best_projlen:
+                        best_projlen = projlens[x[2]]
                     trainExamples[i] = (x[0], x[1], self.game.transform_normalize_reward(best_projlen)) 
-                return trainExamples[:-1], action_list, projlens
+                return trainExamples, action_list[1:], projlens[1:]
+            
+            episodeStep += 1
+            canonicalBoard = self.game.getCanonicalForm(board, curPlayer)
+            temp = int(episodeStep < args.tempThreshold)
+            playout_cap_randomization = np.random.rand() < args.playout_cap_randomization_prob
+            
+            if playout_cap_randomization :
+                # On a small proportion p of
+                # turns, we perform a full search, stopping when the tree reaches a cap of N nodes, and for all
+                pi = self.mcts.getActionProb(canonicalBoard, cur_garside_len, action_list, 
+                                             num_playouts = self.nummaxMCTSSims, temp=temp,
+                                             apply_Dirichlet_noise = True)
+                sym = self.game.getSymmetries(canonicalBoard, pi)
+                for b, p in sym:
+                    trainExamples.append([b, p, cur_garside_len, None])
+                action = np.random.choice(len(pi), p=pi)
+            else:
+                # other turns we perform a fast search with a much smaller cap of n < N. Only turns with a
+                # full search are recorded for training. 
+                pi = self.mcts.getActionProb(canonicalBoard, cur_garside_len, action_list, 
+                                            num_playouts = self.numminMCTSSims, temp=temp,
+                                            apply_Dirichlet_noise = False)
+                action = np.random.choice(len(pi), p=pi)
             
             try:
                 board, next_garside_len, projlen = self.game.getNextState(board, action, cur_garside_len)
                 projlens.append(projlen)
                 last_action = action 
-                action_list.append(action)
-                if next_garside_len % 20 == 0: print ("pi", next_garside_len, pi, "action_list", action_list, "projlen", projlen)
+                action_list += (action,)
+                if next_garside_len % 20 == 0: print ("pi", next_garside_len, pi, "action_list", action_list, "projlen", projlen, flush=True)
             except:
                 best_projlen = np.inf
-                for i in range(len(trainExamples) - 1, -1, -1):
+                # reward is minimum projlen attained after applying the action
+                for i in range(len(trainExamples) - 1, -1, -1): 
                     x = trainExamples[i] 
-                    if projlens[i] < best_projlen:
+                    if projlens[i+1] < best_projlen:
                         best_projlen = projlens[i]
                     trainExamples[i] = (x[0], x[1], self.game.transform_normalize_reward(best_projlen)) 
-                return trainExamples[:-1], action_list, projlens
+                return trainExamples, action_list[1:], projlens[1:]
             
 class BraidGame():
     """
@@ -221,7 +282,7 @@ class BraidGame():
             # print ("product_matrix_so_far", polymat.trim(board), product_matrix_so_far, product_matrix_so_far.shape, polymat.trim(product_matrix_so_far))
             return self.getCanonicalForm(product_matrix_so_far, None), cur_garside_len + 1, polymat.projlen(product_matrix_so_far)
         except:
-            return self.getCanonicalForm(board, None), cur_garside_len + 1, 1e3
+            return self.getCanonicalForm(board, None), 1e3, 1e3
 
     def transform_normalize_reward(self, projlen):
         """
@@ -236,8 +297,8 @@ class BraidGame():
 
         Returns:
             reward: reward for the action
-        """
-        return -np.sign(projlen) * (np.log(np.abs(projlen) + 1)) + 4.5
+        """ 
+        return -np.sign(projlen) * (np.log(np.abs(projlen) + 1)) + args.bias_symlog
     
     def getnextproductmatrix(self, product_matrix_so_far, action):
         """
@@ -325,25 +386,15 @@ class NNet(nn.Module):
         self.args = args
 
         super(NNet, self).__init__() 
-        self.resnet = ResNet() # default: Resnet 18
+        self.resnet = utils.ResNet() # default: Resnet 18
 
         embed_size = 1000
-        self.policy = nn.Sequential(
-            nn.Linear(embed_size, embed_size),
-            nn.BatchNorm1d(embed_size),
-            nn.ReLU(),
-            nn.Dropout(args.dropout),
-            nn.Linear(embed_size, self.action_size)
-        )
-
-        self.value = nn.Sequential(
-            nn.Linear(embed_size, embed_size),
-            nn.BatchNorm1d(embed_size),
-            nn.ReLU(),
-            nn.Dropout(args.dropout),
-            nn.Linear(embed_size, 1)
-        )
-
+        self.policy = nn.ModuleList ([nn.Linear(embed_size, embed_size) for i in range(6)]
+                                     + [nn.Linear(embed_size, self.action_size)])
+        self.value = nn.ModuleList ([nn.Linear(embed_size, embed_size) for i in range(6)] 
+                                    + [nn.Linear(embed_size, 1)])
+                                     
+        
     def forward(self, s):
         """
         Input:
@@ -359,8 +410,16 @@ class NNet(nn.Module):
             s = s.unsqueeze(0)
 
         s = self.resnet(s)
-        pi = self.policy(s)                                          # batch_size x action_size
-        v = self.value(s)                                            # batch_size x 1
+        pi = s
+        for pl in self.policy[:-1]:
+            pi = F.relu(pl(pi)) + pi
+        pi = self.policy[-1](pi) 
+
+        v = s
+        for val in self.value[:-1]:
+            v = F.relu(val(s)) + s
+        v = self.value[-1](v)
+        
         # print ("pi, v", (F.log_softmax(pi, dim=1)) , v)
         return F.log_softmax(pi, dim=1), v
      
@@ -376,43 +435,56 @@ class NNetWrapper(NeuralNet.NeuralNet):
         if args.cuda:
             self.nnet.cuda()
 
-    def train(self, examples, policy):
+    def set_eval_mode(self):
+        self.nnet.eval()
+
+    def train(self, examples, policy, lr):
         """
         examples: list of examples, each example is of form (board, pi, v)
+        policy: "net" or "random"
+        lr: learning rate
 
         if policy is random, only do value training
         """
-        optimizer = torch.optim.Adam(self.nnet.parameters())
+        # Convert examples to tensors
+        print ("examples", len(examples), len(examples[0]))
+        boards, pis, vs = list(zip(*examples))
+        boards = torch.tensor(np.stack(boards))
+        pis = torch.tensor(np.stack(pis))
+        vs = torch.tensor(np.stack(vs).astype(np.float64)) 
+        # drop nans from vs 
+        # Create a dataset from tensors
+        dataset = torch.utils.data.TensorDataset(boards, pis, vs)
+
+        # Create a data loader
+        train_loader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+
+        optimizer = torch.optim.Adam(self.nnet.parameters(), 
+                                    lr=lr,
+                                    weight_decay=1e-8)
 
         for epoch in range(args.epochs):
             print('EPOCH ::: ' + str(epoch + 1))
             self.nnet.train()
-            pi_losses = AverageMeter()
-            v_losses = AverageMeter()
+            pi_losses = utils.AverageMeter()
+            v_losses = utils.AverageMeter()
+ 
+            t = tqdm(train_loader, desc='Training Net')
 
-            batch_count = int(len(examples) / args.batch_size)
-            print ("len(examples)", len(examples))
-            t = tqdm(range(batch_count), desc='Training Net')
-            for _ in t:
+            for boards, target_pis, target_vs in t:
+
+            
                 optimizer.zero_grad()
-
-                sample_ids = np.random.randint(len(examples), size=args.batch_size)
-                boards, pis, vs = list(zip(*[examples[i] for i in sample_ids]))
-                boards = torch.FloatTensor(np.array(boards).astype(np.float64))
-                target_pis = torch.FloatTensor(np.array(pis))
-                target_vs = torch.FloatTensor(np.array(vs).astype(np.float64))
-
                 # predict
                 if args.cuda:
-                    boards, target_pis, target_vs = boards.contiguous().cuda(), target_pis.contiguous().cuda(), target_vs.contiguous().cuda()
+                    boards, target_pis, target_vs = boards.cuda(), target_pis.cuda(), target_vs.cuda()
 
                 # compute output
                 out_pi, out_v = self.nnet(boards)
-                
-                
+
                 l_pi = self.loss_pi(target_pis, out_pi)    
                 l_v = self.loss_v(target_vs, out_v)
-                
+
                 if policy == "random":
                     total_loss = l_v
                 else: 
@@ -425,6 +497,8 @@ class NNetWrapper(NeuralNet.NeuralNet):
                 # compute gradient and do SGD step
                 total_loss.backward()
                 optimizer.step()
+
+        return pi_losses.avg, v_losses.avg
 
     def predict(self, board):
         """
@@ -478,7 +552,9 @@ class MCTS():
     def __init__(self, game, nnet, args):
         self.game = game
         self.nnet = nnet
-        self.args = args
+        self.args = args 
+        self.Qbias = {i: (-i/50 + 1) for i in range(args.max_garside_len)} # line from (0,1) to (100,-1), function of Qbias with cur_garside_len as parameter
+        # since we start off at "really good" states
         self.Qsa = {}  # stores Q values for s,a (as defined in the paper)
         self.Nsa = {}  # stores #times edge s,a was visited
         self.Ns = {}  # stores #times board s was visited
@@ -487,7 +563,8 @@ class MCTS():
         self.Es = {}  # stores game.getGameEnded ended for board s
         self.Vs = {}  # stores game.getValidMoves for board s
 
-    def getActionProb(self, canonicalBoard, cur_garside_len, last_action, temp=1):
+    def getActionProb(self, canonicalBoard, cur_garside_len, action_list, num_playouts, temp=1,
+                      apply_Dirichlet_noise = True):
         """
         This function performs numMCTSSims simulations of MCTS starting from
         canonicalBoard.
@@ -495,18 +572,22 @@ class MCTS():
         Params:
             canonicalBoard: current board
             cur_garside_len: length of the braid before applying action
-            last_action: last action taken by current player 
+            action_list: list of actions taken by current player
+                we need last action taken by current player 
                 (needed to mask out invalid moves)
+            num_playouts: number of playouts
             temp: temp=erature
+            apply_Dirichlet_noise: whether to apply Dirichlet noise to the root node
 
         Returns:
             probs: a policy vector where the probability of the ith action is
                    proportional to Nsa[(s,a)]**(1./temp)
         """
-        for i in range(self.args.numMCTSSims):
-            self.search(canonicalBoard, cur_garside_len, last_action)
+        for i in range(num_playouts):
+            self.search(canonicalBoard, cur_garside_len, action_list, root=apply_Dirichlet_noise)
 
         s = self.game.stringRepresentation(canonicalBoard)
+        s = action_list
         counts = [self.Nsa[(s, a)] if (s, a) in self.Nsa else 0 for a in range(self.game.getActionSize())]
 
         if temp == 0:
@@ -521,7 +602,7 @@ class MCTS():
         probs = [x / counts_sum for x in counts]
         return probs
 
-    def search(self, canonicalBoard, cur_garside_len, last_action):
+    def search(self, canonicalBoard, cur_garside_len, action_list, root=False):
         """
         This function performs one iteration of MCTS. It is recursively called
         till a leaf node is found. The action chosen at each node is one that
@@ -540,17 +621,20 @@ class MCTS():
         Params:
             canonicalBoard: current board
             cur_garside_len: length of the braid before applying action
-            last_action: last action taken by current player 
-                (needed to mask out invalid moves) 
+            action_list: list of actions taken by current player
+                we need last action taken by current player 
+                (needed to mask out invalid moves)
         Returns:
             v: the negative of the value of the current canonicalBoard
         """
 
-        s = self.game.stringRepresentation(canonicalBoard)
-        
+        # s = self.game.stringRepresentation(canonicalBoard)
+        s = action_list
+        last_action = action_list[-1] 
+        # print ("executing search on", s, "cur_garside_len", cur_garside_len)
         if self.game.getGameEnded(cur_garside_len) != 0:
             # terminal node 
-            print ("terminal node", s)
+            # print ("terminal node", s)
             if s not in self.Es:
                 _, v = self.nnet.predict(canonicalBoard)
                 self.Es[s] = v
@@ -559,7 +643,9 @@ class MCTS():
 
         if s not in self.Ps:
             # leaf node 
+            # print ("s", s, "not in Ps")
             self.Ps[s], self.Es[s] = self.nnet.predict(canonicalBoard)
+            # if : print ("Ps", self.Ps[s], "Es", self.Es[s])
             v = self.Es[s] # value of the leaf node
             valids = self.game.getValidMoves(last_action) 
             # print ("valids", valids)
@@ -567,46 +653,70 @@ class MCTS():
             # print ("masked self.Ps[s], v", s )
             sum_Ps_s = np.sum(self.Ps[s])
             if sum_Ps_s > 0:
-                self.Ps[s] /= sum_Ps_s  # renormalize
+                self.Ps[s] /= sum_Ps_s  # renormalize 
             else:
-                raise ValueError(f'All valid moves were masked. {self.Ps[s]}')
+                # raise ValueError(f'All valid moves were masked. {self.Ps[s]}')
                 # if all valid moves were masked make all valid moves equally probable
 
                 # NB! All valid moves may be masked if either your NNet architecture is insufficient or you've get overfitting or something else.
                 # If you have got dozens or hundreds of these messages you should pay attention to your NNet and/or training process.   
-                # log.error("All valid moves were masked, doing a workaround.")
-                # self.Ps[s] = self.Ps[s] + valids
-                # self.Ps[s] /= np.sum(self.Ps[s])
+                
+                p, v = self.nnet.nnet(torch.FloatTensor(canonicalBoard).cuda())
+                log.error(f"All valid moves were masked, doing a workaround {p, v}")
+                self.Ps[s] = self.Ps[s] + valids
+                self.Ps[s] /= np.sum(self.Ps[s])
 
             self.Vs[s] = valids
             self.Ns[s] = 0
+            
             return v
+
+        # print ("s", s, "in Ps")        
 
 
         valids = self.Vs[s]
         cur_best = -float('inf')
         best_act = -1
+        if root == True:
+            num_valids = np.sum(valids) 
+            noise = np.random.dirichlet([0.3] * int(num_valids)) 
+            noise_id = 0
+             
+        
+        prior_probability = {}
 
         # pick the action with the highest upper confidence bound
+        us = []
+        # netp = {}
         for a in range(self.game.getActionSize()):
-             
             if valids[a]:
-                if (s, a) in self.Qsa:
-                    u = self.Qsa[(s, a)] + self.args.cpuct * self.Ps[s][a] * math.sqrt(self.Ns[s]) / (
-                            1 + self.Nsa[(s, a)])
+                if root == True: # add dirichlet noise to the prior probability for the root node
+                    # netp[a] = self.Ps[s][a]
+                    prior_probability[a] = 0.75 * self.Ps[s][a] + 0.25 * noise[noise_id]
+                    noise_id += 1
                 else:
-                    u = self.args.cpuct * self.Ps[s][a] * math.sqrt(self.Ns[s] + EPS)  # Q = 0 ?
-
+                    prior_probability[a] = self.Ps[s][a]
+                if (s, a) in self.Qsa:
+                    u = self.Qsa[(s, a)] + self.args.cpuct * prior_probability[a] * math.sqrt(self.Ns[s]) / (
+                            1 + self.Nsa[(s, a)])
+                    # if root == True: print ("u", s, "a", a, "u", u, "Q",self.Qsa[(s, a)], "netp", netp[a],  "prior_probability", prior_probability[a], "Ns", self.Ns[s], "UCB",self.args.cpuct * prior_probability[a] * math.sqrt(self.Ns[s]) / ( \
+                    #         1 + self.Nsa[(s, a)]), flush=True)
+                else:
+                    u = self.Qbias[cur_garside_len] + self.args.cpuct * (prior_probability[a]) * math.sqrt(self.Ns[s] + EPS)  # Q = 0 ?
+                    # if root == True: print ("u", s, "a", a, "u", u, "netp", netp[a],"prior_probability", prior_probability[a], "Ns", self.Ns[s], flush=True)
+                us.append([a,u])
                 if u > cur_best:
                     cur_best = u
                     best_act = a
-
+                
+        sort_us_by_u = sorted(us, key=lambda x: x[1], reverse=True)
         a = best_act 
-        # print ("best_act", s, best_act)
+        # print ("best_act", s, best_act, sort_us_by_u)
         next_s, next_cur_garside_len, _ = self.game.getNextState(canonicalBoard, a, cur_garside_len)
         next_s = self.game.getCanonicalForm(next_s, next_cur_garside_len)
-        print ("recursion", cur_garside_len, s, self.game.stringRepresentation(next_s))
-        v = self.search(next_s, next_cur_garside_len, a) # Search recursively
+        # print ("recursion", cur_garside_len, s, self.game.stringRepresentation(next_s))
+        # Search recursively
+        v = self.search(next_s, next_cur_garside_len, action_list + (a,), root=False)
 
         if (s, a) in self.Qsa:
             self.Qsa[(s, a)] = (self.Nsa[(s, a)] * self.Qsa[(s, a)] + v) / (self.Nsa[(s, a)] + 1)
@@ -617,6 +727,7 @@ class MCTS():
             self.Nsa[(s, a)] = 1
 
         self.Ns[s] += 1 
+        # print ("Ps", self.Ps.keys(), flush=True)
         return v
 
 class Coach():
@@ -630,83 +741,10 @@ class Coach():
         self.nnet = nnet
         # self.pnet = self.nnet.__class__(self.game)  # the competitor network
         self.args = args
-        self.mcts = MCTS(self.game, self.nnet, self.args)
         self.trainExamplesHistory = []  # history of examples from args.numItersForTrainExamplesHistory latest iterations
         self.skipFirstSelfPlay = False  # can be overriden in loadTrainExamples() 
         self.best_projlen_and_seq = {i: [None, np.inf] for i in range(self.args.max_garside_len + 1)}
-    
-    def executeEpisode(self, policy="net"):
-        """
-        This function executes one episode of self-play, starting with player 1.
-        As the game is played, each turn is added as a training example to
-        trainExamples. The game is played till the game ends. After the game
-        ends, the outcome of the game is used to assign values to each example
-        in trainExamples.
-
-        It uses a temp=1 if episodeStep < tempThreshold, and thereafter
-        uses temp=0.
-
-        Returns:
-            trainExamples: a list of examples of the form (canonicalBoard, currPlayer, pi,v)
-                           pi is the MCTS informed policy vector, v is +1 if
-                           the player eventually won the game, else -1.
-        """
-        trainExamples = []
-        board = self.game.getInitBoard()
-        self.curPlayer = 1
-        episodeStep = 0
-
-        last_action = 0
-        projlens = [1]
-        action_list = [0]
-        for cur_garside_len in range(self.game.getBoardSize() + 1):
-            episodeStep += 1
-            canonicalBoard = self.game.getCanonicalForm(board, self.curPlayer)
-            temp = int(episodeStep < self.args.tempThreshold)
-            if policy == "net":
-                pi = self.mcts.getActionProb(canonicalBoard, cur_garside_len, last_action, temp=temp)
-                sym = self.game.getSymmetries(canonicalBoard, pi)
-                for b, p in sym:
-                    trainExamples.append([b, p, None])
-                action = np.random.choice(len(pi), p=pi)
-                
-            elif policy == "random":
-                pi = cur_garside_len
-                valids = self.game.getValidMoves(last_action)
-                valids = valids / np.sum(valids)  # make valids into probability dist
-                action = np.random.choice(self.game.getActionSize(), p=valids)
-                sym = self.game.getSymmetries(canonicalBoard, valids)
-                for b, p in sym:
-                    trainExamples.append([b, p, None])
-
-            if self.game.getGameEnded(cur_garside_len):
-                best_projlen = np.inf
-                # reward is minimum projlen attained after applying the action
-                for i in range(len(trainExamples) - 2, -1, -1): # assign values to each example
-                    x = trainExamples[i] 
-                    if projlens[i] < best_projlen:
-                        best_projlen = projlens[i]
-                    trainExamples[i] = (x[0], x[1], self.transform_normalize_reward(best_projlen))
-                # print ("trainExamples", [i[0][0] for i in trainExamples])
-                return trainExamples[:-1]
-                
-            try:
-                board, next_garside_len, projlen = self.game.getNextState(board, action, cur_garside_len)
-                projlens.append(projlen)
-                last_action = action 
-                action_list.append(action)
-                print ("pi", pi, "action_list", action_list, "projlen", projlen)
-                if projlen < self.best_projlen_and_seq[next_garside_len][1]:
-                    self.best_projlen_and_seq[next_garside_len] = [action_list, projlen]  
-            except: 
-                best_projlen = np.inf
-                for i in range(len(trainExamples) - 1, -1, -1): # assign values to each example
-                    x = trainExamples[i] 
-                    if projlens[i] < best_projlen:
-                        best_projlen = projlens[i]
-                    trainExamples[i] = (x[0], x[1], self.transform_normalize_reward(best_projlen))
-                # print ("trainExamples", [i[2] for i in trainExamples])
-                return trainExamples[:-1]
+     
                 
     def learn(self):
         """
@@ -715,80 +753,99 @@ class Coach():
         examples in trainExamples (which has a maximum length of maxlenofQueue).
         It then pits the new neural network against the old one and accepts it
         only if it wins >= updateThreshold fraction of games.
-        """
 
-        for i in range(1, self.args.numIters + 1):
+        Progressively increase the number of MCTS simulations used in the tree
+        as training progresses.
+        """
+        if self.args.do_pretrain:
+            self.trainExamplesHistory = []
+            for i in range(0, self.args.startIter):
+                self.trainExamplesHistory.extend(self.loadTrainExamples(i))  
+
+            trainExamples = []
+            for e in self.trainExamplesHistory:
+                trainExamples.extend(e)
+            print ("trainExamples", len(trainExamples)) 
+            pi_loss, v_loss = self.nnet.train(trainExamples[:10000], policy="random", lr = self.args.pretrain_lr)
+            
+        for i in range(self.args.startIter, self.args.numIters + 1):
             # bookkeeping
             log.info(f'Starting Iter #{i} ...')
             # examples of the iteration
-            
-            if i == 1: # Random play for the first iteration
-                self.loadTrainExamples(i - 1)
-                policy = "random"
-                continue 
-            elif i > 1: # NNet policy for the rest of the iterations
-                iterationTrainExamples = deque([], maxlen=self.args.maxlenOfQueue)
-                policy = "net"
+             
+            policy = "net"
+            iterationTrainExamples = []
+            nummaxMCTSSims = 2*i + self.args.nummaxMCTSSims
+            numminMCTSSims = i + self.args.numminMCTSSims
+            for j in range(0, self.args.numEps, args.num_jobs_at_a_time):
+                actors = [Self_play.remote(policy, self.game, self.nnet, nummaxMCTSSims, numminMCTSSims, self.args) for _ in range(args.num_jobs_at_a_time)]
+                iterationTrainExamples += ray.get([actor.executeEpisode.remote() for actor in actors])
 
-                # self.mcts = MCTS(self.game, self.nnet, self.args)  # reset search tree
-                # for _ in tqdm(range(self.args.numEps), desc="Self Play"):
-                #     iterationTrainExamples += self.executeEpisode(policy=policy)
-                #     print ("best projlen", self.best_projlen_and_seq)
-                # save the iteration examples to the history 
+            iterationTrainExamples, action_lists, projlens = zip(*iterationTrainExamples) 
+            # iterationTrainExamples: list of list of examples of the form (canonicalBoard, currPlayer, pi,v)
+            iterationTrainExamples = [item for sublist in iterationTrainExamples for item in sublist]
+            print ("iterationTrainExamples", len(iterationTrainExamples))
+            print ("action_lists", action_lists, flush=True)
+            print ("projlens", projlens, flush=True)
+            for (action_list, projlen) in zip(action_lists, projlens):
                  
-                actors = [Self_play.remote(policy, self.game, self.nnet, self.args) for _ in range(self.args.numEps)]
-                iterationTrainExamples = ray.get([actor.executeEpisode.remote() for actor in actors])
-                print ("iterationTrainExamples", iterationTrainExamples)
-                self.trainExamplesHistory.append(iterationTrainExamples)
+                for l in range(0, len(action_list)):
+                    if projlen[l] < self.best_projlen_and_seq[l+1][1]:
+                        self.best_projlen_and_seq[l+1] = [action_list[:l], projlen[l]] 
+                    if projlen[l] == 1:
+                        print ("found kernel", action_list[:l])
+            
 
-                if len(self.trainExamplesHistory) > self.args.numItersForTrainExamplesHistory:
-                    log.warning(
-                        f"Removing the oldest entries in trainExamples. len(trainExamplesHistory) = {len(self.trainExamplesHistory)}")
-                    self.trainExamplesHistory = self.trainExamplesHistory[-self.args.numItersForTrainExamplesHistory:]
-                    
-                # backup history to a file
-                # NB! the examples were collected using the model from the previous iteration, so (i-1)  
-                self.saveTrainExamples(i - 1)
+            print ("self.best_projlen_and_seq", self.best_projlen_and_seq)
 
-            # shuffle examples before training
+            self.saveTrainExamples(iterationTrainExamples, i - 1)
+            iterationTrainExamples = self.loadTrainExamples(i - 1)
+            self.trainExamplesHistory.extend(iterationTrainExamples)
+           
+            if len(self.trainExamplesHistory) > self.args.numItersForTrainExamplesHistory:
+                log.warning(
+                    f"Removing the oldest entries in trainExamples. len(trainExamplesHistory) = {len(self.trainExamplesHistory)}")
+                self.trainExamplesHistory = self.trainExamplesHistory[-self.args.numItersForTrainExamplesHistory:]
+                 
+
             trainExamples = []
             for e in self.trainExamplesHistory:
                 trainExamples.extend(e)
             print ("trainExamples", len(trainExamples))
-            np.random.shuffle(trainExamples)
 
             # training new network, keeping a copy of the old one
             self.nnet.save_checkpoint(folder=self.args.checkpoint, filename='temp.pth.tar')
-            # self.pnet.load_checkpoint(folder=self.args.checkpoint, filename='temp.pth.tar')
-            # pmcts = MCTS(self.game, self.pnet, self.args)
+            pi_loss, v_loss = self.nnet.train(trainExamples, policy=policy, lr = self.args.lr) 
 
-            self.nnet.train(trainExamples, policy=policy)
-            # nmcts = MCTS(self.game, self.nnet, self.args)
-
-            # log.info('PITTING AGAINST PREVIOUS VERSION')
-            # arena = Arena(lambda x: np.argmax(pmcts.getActionProb(x, temp=0)),
-            #               lambda x: np.argmax(nmcts.getActionProb(x, temp=0)), self.game)
-            # pwins, nwins, draws = arena.playGames(self.args.arenaCompare)
-
-            # log.info('NEW/PREV WINS : %d / %d ; DRAWS : %d' % (nwins, pwins, draws))
-            # if pwins + nwins == 0 or float(nwins) / (pwins + nwins) < self.args.updateThreshold:
-            #     log.info('REJECTING NEW MODEL')
-            #     self.nnet.load_checkpoint(folder=self.args.checkpoint, filename='temp.pth.tar')
-            # else:
-            #     log.info('ACCEPTING NEW MODEL')
-            #     self.nnet.save_checkpoint(folder=self.args.checkpoint, filename=self.getCheckpointFile(i))
-            #     self.nnet.save_checkpoint(folder=self.args.checkpoint, filename='best.pth.tar')
+            self.logtrainingmetrics(action_lists, projlens, pi_loss, v_loss, i - 1)
 
     def getCheckpointFile(self, iteration):
-        return 'checkpoint_' + str(iteration) + '.pth.tar'
+        return 'checkpoint_epoch_' + str(iteration) + f'_mod_p_{args.mod_p}'
 
-    def saveTrainExamples(self, iteration):
+    def saveTrainExamples(self, iterationTrainExamples, iteration):
+        if args.debug: return
         folder = self.args.checkpoint
         if not os.path.exists(folder):
             os.makedirs(folder)
         filename = os.path.join(folder, self.getCheckpointFile(iteration) + f"_{time.time()}.examples")
         with open(filename, "wb+") as f:
-            Pickler(f).dump(self.trainExamplesHistory)
+            Pickler(f).dump(iterationTrainExamples)
+        f.closed
+
+    def logtrainingmetrics(self, action_lists, projlens, pi_loss, v_loss, iteration):
+        if args.debug: return
+        folder = self.args.checkpoint 
+        if not os.path.exists(folder):
+            os.makedirs(folder)
+        filename = os.path.join(folder, f"iteration_{iteration}_{time.time()}.actions_projlens") 
+        action_lists_projlens = {
+            "action_lists": action_lists,
+            "projlens": projlens, 
+            "pi_loss": pi_loss,
+            "v_loss": v_loss,
+        }
+        with open(filename, "wb+") as f:
+            Pickler(f).dump(action_lists_projlens)
         f.closed
 
     def loadTrainExamples(self, iteration):
@@ -797,14 +854,15 @@ class Coach():
             os.makedirs(folder)
         fs = glob.glob(os.path.join(folder, self.getCheckpointFile(iteration) + "*.examples"))
 
-        self.trainExamplesHistory = []
+        iterationTrainExamples = []
         for filename in fs:
             with open(filename, "rb") as f:
-                self.trainExamplesHistory.extend(Unpickler(f).load())
-        log.info('Loading done!')
+                iterationTrainExamples.append(Unpickler(f).load())
+        log.info(f'Loading done for iteration {iteration}!')
+        return iterationTrainExamples
 
-        # examples based on the model were already collected (loaded)
-        self.skipFirstSelfPlay = True
+
+# In[ ]:
 
 
 def main():
@@ -833,3 +891,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

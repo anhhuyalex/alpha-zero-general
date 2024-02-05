@@ -381,3 +381,7 @@ class ResNet(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return self._forward_impl(x)
+
+def is_interactive():
+    import __main__ as main
+    return not hasattr(main, '__file__')
