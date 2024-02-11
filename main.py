@@ -56,8 +56,8 @@ argparser.add_argument('--numEps', default=100, type=int)
 argparser.add_argument('--tempThreshold', default=200, type=int)
 argparser.add_argument('--maxlenOfQueue', default=200000, type=int)
 argparser.add_argument('--num_jobs_at_a_time', default=5, type=int)
-argparser.add_argument('--nummaxMCTSSims', default=5, type=int)
-argparser.add_argument('--numminMCTSSims', default=1, type=int)
+argparser.add_argument('--nummaxMCTSSims', default=8, type=int)
+argparser.add_argument('--numminMCTSSims', default=4, type=int)
 argparser.add_argument('--cpuct', default=1.0, type=float)
 argparser.add_argument('--batch_size', default=256, type=int)
 argparser.add_argument('--epochs', default=10, type=int)
@@ -65,8 +65,8 @@ argparser.add_argument('--pretrain_lr', default=2e-5, type=float)
 argparser.add_argument('--lr', default=6e-5, type=float)
 argparser.add_argument('--checkpoint', default='./temp/')
 argparser.add_argument('--load_model', default=False, type=bool)
-argparser.add_argument('--load_folder_file', default=('/dev/models/8x100x50','best.pth.tar'))
-argparser.add_argument('--numItersForTrainExamplesHistory', default=20, type=int)
+argparser.add_argument('--load_checkpoint', default="", type=str)
+argparser.add_argument('--numItersForTrainExamplesHistory', default=1000, type=int)
 argparser.add_argument('--cuda', default=torch.cuda.is_available(), type=bool)
 argparser.add_argument('--dropout', default=0.0, type=float)
 argparser.add_argument('--mod_p', default=3, type=int)
@@ -78,11 +78,11 @@ if utils.is_interactive():
     args = argparser.parse_args(args=jupyter_args.split())
 else:
     args = argparser.parse_args()
-
+print("configs", args, flush=True)
 EPS = 1e-8
 
 # RAY_DEDUP_LOGS=0 ./.venv/bin/python main.py --numEps 10
-@ray.remote(num_gpus=0.2 if args.cuda == True else 0)
+@ray.remote(num_cpus=0.2, num_gpus=0.2 if args.cuda == True else 0)
 class Self_play:
     def __init__(self, policy, game, nnet, nummaxMCTSSims, numminMCTSSims, args):
         self.policy = policy
@@ -110,30 +110,30 @@ class Self_play:
                         pi is the MCTS informed policy vector, v is +1 if
                         the player eventually won the game, else -1.
 
-        0 [0. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 0.]
-        1 [0. 1. 0. 0. 1. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 1. 0. 0. 0. 0. 0.]
-        2 [0. 0. 1. 1. 0. 0. 0. 0. 0. 0. 0. 0. 1. 1. 0. 0. 1. 0. 0. 0. 0. 0. 0. 0.]
-        3 [0. 1. 0. 0. 1. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 1. 0. 0. 0. 0. 0.]
-        4 [0. 0. 1. 1. 0. 0. 0. 0. 0. 0. 0. 0. 1. 1. 0. 0. 1. 0. 0. 0. 0. 0. 0. 0.]
-        5 [0. 1. 1. 1. 1. 1. 0. 0. 0. 0. 0. 0. 1. 1. 0. 0. 1. 0. 1. 1. 0. 0. 1. 0.]
-        6 [0. 0. 0. 0. 0. 0. 1. 0. 1. 1. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0.]
-        7 [0. 1. 0. 0. 1. 0. 1. 1. 1. 1. 1. 1. 0. 0. 0. 0. 0. 0. 1. 0. 1. 1. 0. 0.]
-        8 [0. 0. 1. 1. 0. 0. 0. 0. 0. 0. 0. 0. 1. 1. 0. 0. 1. 0. 0. 0. 0. 0. 0. 0.]
-        9 [0. 1. 0. 0. 1. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 1. 0. 0. 0. 0. 0.]
-        10 [0. 0. 1. 1. 0. 0. 0. 0. 0. 0. 0. 0. 1. 1. 0. 0. 1. 0. 0. 0. 0. 0. 0. 0.]
-        11 [0. 1. 1. 1. 1. 1. 0. 0. 0. 0. 0. 0. 1. 1. 0. 0. 1. 0. 1. 1. 0. 0. 1. 0.]
-        12 [0. 0. 0. 0. 0. 0. 1. 0. 1. 1. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0.]
-        13 [0. 1. 0. 0. 1. 0. 1. 1. 1. 1. 1. 1. 0. 0. 0. 0. 0. 0. 1. 0. 1. 1. 0. 0.]
-        14 [0. 0. 1. 1. 0. 0. 1. 0. 1. 1. 0. 0. 1. 1. 1. 1. 1. 1. 0. 0. 0. 0. 0. 0.]
-        15 [0. 1. 0. 0. 1. 0. 1. 1. 1. 1. 1. 1. 0. 0. 0. 0. 0. 0. 1. 0. 1. 1. 0. 0.]
-        16 [0. 0. 1. 1. 0. 0. 0. 0. 0. 0. 0. 0. 1. 1. 0. 0. 1. 0. 0. 0. 0. 0. 0. 0.]
-        17 [0. 1. 1. 1. 1. 1. 0. 0. 0. 0. 0. 0. 1. 1. 0. 0. 1. 0. 1. 1. 0. 0. 1. 0.]
-        18 [0. 0. 0. 0. 0. 0. 1. 0. 1. 1. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0.]
-        19 [0. 1. 0. 0. 1. 0. 1. 1. 1. 1. 1. 1. 0. 0. 0. 0. 0. 0. 1. 0. 1. 1. 0. 0.]
-        20 [0. 0. 1. 1. 0. 0. 1. 0. 1. 1. 0. 0. 1. 1. 1. 1. 1. 1. 0. 0. 0. 0. 0. 0.]
-        21 [0. 1. 0. 0. 1. 0. 1. 1. 1. 1. 1. 1. 0. 0. 0. 0. 0. 0. 1. 0. 1. 1. 0. 0.]
-        22 [0. 0. 1. 1. 0. 0. 1. 0. 1. 1. 0. 0. 1. 1. 1. 1. 1. 1. 0. 0. 0. 0. 0. 0.]
-        23 [0. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 0.]
+        0 []
+        1 [1, 4, 18]
+        2 [2, 3, 12, 13, 16]
+        3 [1, 4, 18]
+        4 [2, 3, 12, 13, 16]
+        5 [1, 2, 3, 4, 5, 12, 13, 16, 18, 19, 22]
+        6 [6, 8, 9]
+        7 [1, 4, 6, 7, 8, 9, 10, 11, 18, 20, 21]
+        8 [2, 3, 12, 13, 16]
+        9 [1, 4, 18]
+        10 [2, 3, 12, 13, 16]
+        11 [1, 2, 3, 4, 5, 12, 13, 16, 18, 19, 22]
+        12 [6, 8, 9]
+        13 [1, 4, 6, 7, 8, 9, 10, 11, 18, 20, 21]
+        14 [2, 3, 6, 8, 9, 12, 13, 14, 15, 16, 17]
+        15 [1, 4, 6, 7, 8, 9, 10, 11, 18, 20, 21]
+        16 [2, 3, 12, 13, 16]
+        17 [1, 2, 3, 4, 5, 12, 13, 16, 18, 19, 22]
+        18 [6, 8, 9]
+        19 [1, 4, 6, 7, 8, 9, 10, 11, 18, 20, 21]
+        20 [2, 3, 6, 8, 9, 12, 13, 14, 15, 16, 17]
+        21 [1, 4, 6, 7, 8, 9, 10, 11, 18, 20, 21]
+        22 [2, 3, 6, 8, 9, 12, 13, 14, 15, 16, 17]
+        23 [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
         """
         
         
@@ -218,7 +218,10 @@ class BraidGame():
 
 
         mask_lookup_table = copy.deepcopy(nft.follows)
-        print ("mask_lookup_table", mask_lookup_table , len(mask_lookup_table) )
+        print ("mask_lookup_table")
+        for i in range(24):
+            print (i, mask_lookup_table[i])
+        
         mask_lookup_table[0] =  [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22] # mask for None token, 0
         masks = np.zeros((24, 24)) 
         for i in range(24):
@@ -535,9 +538,8 @@ class NNetWrapper(NeuralNet.NeuralNet):
             'state_dict': self.nnet.state_dict(),
         }, filepath)
 
-    def load_checkpoint(self, folder='checkpoint', filename='checkpoint.pth.tar'):
+    def load_checkpoint(self, filepath):
         # https://github.com/pytorch/examples/blob/master/imagenet/main.py#L98
-        filepath = os.path.join(folder, filename)
         if not os.path.exists(filepath):
             raise ("No model in path {}".format(filepath))
         map_location = None if args.cuda else 'cpu'
@@ -553,7 +555,7 @@ class MCTS():
         self.game = game
         self.nnet = nnet
         self.args = args 
-        self.Qbias = {i: (-i/50 + 1) for i in range(args.max_garside_len)} # line from (0,1) to (100,-1), function of Qbias with cur_garside_len as parameter
+        self.Qbias = {i: (-0.04247 *i+2.247) for i in range(args.max_garside_len)} # line from (0,2.247) to (100,-2), function of Qbias with cur_garside_len as parameter
         # since we start off at "really good" states
         self.Qsa = {}  # stores Q values for s,a (as defined in the paper)
         self.Nsa = {}  # stores #times edge s,a was visited
@@ -631,7 +633,7 @@ class MCTS():
         # s = self.game.stringRepresentation(canonicalBoard)
         s = action_list
         last_action = action_list[-1] 
-        # print ("executing search on", s, "cur_garside_len", cur_garside_len)
+        print ("executing search on", s, "cur_garside_len", cur_garside_len)
         if self.game.getGameEnded(cur_garside_len) != 0:
             # terminal node 
             # print ("terminal node", s)
@@ -643,7 +645,7 @@ class MCTS():
 
         if s not in self.Ps:
             # leaf node 
-            # print ("s", s, "not in Ps")
+            print ("s", s, "not in Ps")
             self.Ps[s], self.Es[s] = self.nnet.predict(canonicalBoard)
             # if : print ("Ps", self.Ps[s], "Es", self.Es[s])
             v = self.Es[s] # value of the leaf node
@@ -667,7 +669,7 @@ class MCTS():
                 self.Ps[s] /= np.sum(self.Ps[s])
 
             self.Vs[s] = valids
-            self.Ns[s] = 0
+            self.Ns[s] = 1
             
             return v
 
@@ -687,11 +689,12 @@ class MCTS():
 
         # pick the action with the highest upper confidence bound
         us = []
-        # netp = {}
+        netp = {}
         for a in range(self.game.getActionSize()):
             if valids[a]:
+                netp[a] = self.Ps[s][a]
                 if root == True: # add dirichlet noise to the prior probability for the root node
-                    # netp[a] = self.Ps[s][a]
+                    
                     prior_probability[a] = 0.75 * self.Ps[s][a] + 0.25 * noise[noise_id]
                     noise_id += 1
                 else:
@@ -699,11 +702,11 @@ class MCTS():
                 if (s, a) in self.Qsa:
                     u = self.Qsa[(s, a)] + self.args.cpuct * prior_probability[a] * math.sqrt(self.Ns[s]) / (
                             1 + self.Nsa[(s, a)])
-                    # if root == True: print ("u", s, "a", a, "u", u, "Q",self.Qsa[(s, a)], "netp", netp[a],  "prior_probability", prior_probability[a], "Ns", self.Ns[s], "UCB",self.args.cpuct * prior_probability[a] * math.sqrt(self.Ns[s]) / ( \
-                    #         1 + self.Nsa[(s, a)]), flush=True)
+                    print ("u", s, "a", a, "u", u, "Q",self.Qsa[(s, a)], "netp", netp[a],  "prior_probability", prior_probability[a], "Ns", self.Ns[s], "UCB",self.args.cpuct * prior_probability[a] * math.sqrt(self.Ns[s]) / ( \
+                            1 + self.Nsa[(s, a)]), flush=True)
                 else:
                     u = self.Qbias[cur_garside_len] + self.args.cpuct * (prior_probability[a]) * math.sqrt(self.Ns[s] + EPS)  # Q = 0 ?
-                    # if root == True: print ("u", s, "a", a, "u", u, "netp", netp[a],"prior_probability", prior_probability[a], "Ns", self.Ns[s], flush=True)
+                    print ("u", s, "a", a, "u", u, "netp", netp[a],"prior_probability", prior_probability[a], "Ns", self.Ns[s], flush=True)
                 us.append([a,u])
                 if u > cur_best:
                     cur_best = u
@@ -711,7 +714,7 @@ class MCTS():
                 
         sort_us_by_u = sorted(us, key=lambda x: x[1], reverse=True)
         a = best_act 
-        # print ("best_act", s, best_act, sort_us_by_u)
+        print ("best_act", s, best_act, sort_us_by_u)
         next_s, next_cur_garside_len, _ = self.game.getNextState(canonicalBoard, a, cur_garside_len)
         next_s = self.game.getCanonicalForm(next_s, next_cur_garside_len)
         # print ("recursion", cur_garside_len, s, self.game.stringRepresentation(next_s))
@@ -757,6 +760,10 @@ class Coach():
         Progressively increase the number of MCTS simulations used in the tree
         as training progresses.
         """
+        if args.load_checkpoint != "":
+            print("loading checkpoint", args.load_checkpoint)
+            self.nnet.load_checkpoint(args.load_checkpoint)
+
         if self.args.do_pretrain:
             self.trainExamplesHistory = []
             for i in range(0, self.args.startIter):
@@ -766,8 +773,10 @@ class Coach():
             for e in self.trainExamplesHistory:
                 trainExamples.extend(e)
             print ("trainExamples", len(trainExamples)) 
-            pi_loss, v_loss = self.nnet.train(trainExamples[:10000], policy="random", lr = self.args.pretrain_lr)
-            
+            pi_loss, v_loss = self.nnet.train(trainExamples, policy="net", lr = self.args.pretrain_lr)
+            self.nnet.save_checkpoint(folder=self.args.checkpoint, filename='pretrained.pth.tar')
+
+        
         for i in range(self.args.startIter, self.args.numIters + 1):
             # bookkeeping
             log.info(f'Starting Iter #{i} ...')
@@ -775,7 +784,7 @@ class Coach():
              
             policy = "net"
             iterationTrainExamples = []
-            nummaxMCTSSims = 2*i + self.args.nummaxMCTSSims
+            nummaxMCTSSims = 3*i + self.args.nummaxMCTSSims
             numminMCTSSims = i + self.args.numminMCTSSims
             for j in range(0, self.args.numEps, args.num_jobs_at_a_time):
                 actors = [Self_play.remote(policy, self.game, self.nnet, nummaxMCTSSims, numminMCTSSims, self.args) for _ in range(args.num_jobs_at_a_time)]
@@ -789,9 +798,9 @@ class Coach():
             print ("projlens", projlens, flush=True)
             for (action_list, projlen) in zip(action_lists, projlens):
                  
-                for l in range(0, len(action_list)):
+                for l in range(1, len(action_list)):
                     if projlen[l] < self.best_projlen_and_seq[l+1][1]:
-                        self.best_projlen_and_seq[l+1] = [action_list[:l], projlen[l]] 
+                        self.best_projlen_and_seq[l] = [action_list[:l], projlen[l]] 
                     if projlen[l] == 1:
                         print ("found kernel", action_list[:l])
             
@@ -872,19 +881,10 @@ def main():
     # log.info('Loading %s...', nn.__name__)
     nnet = NNetWrapper(g)
 
-    # if args.load_model:
-    #     log.info('Loading checkpoint "%s/%s"...', args.load_folder_file[0], args.load_folder_file[1])
-    #     nnet.load_checkpoint(args.load_folder_file[0], args.load_folder_file[1])
-    # else:
-    #     log.warning('Not loading a checkpoint!')
 
     log.info('Loading the Coach...')
     c = Coach(g, nnet, args)
-
-    # if args.load_model:
-    #     log.info("Loading 'trainExamples' from file...")
-    #     c.loadTrainExamples()
-
+ 
     log.info('Starting the learning process 🎉')
     c.learn()
 
