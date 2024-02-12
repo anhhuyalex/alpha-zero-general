@@ -815,7 +815,7 @@ class Coach():
             for id, game in enumerate(iterationTrainExamples):
                 for cur_garside_len in game:
                     _ = game[cur_garside_len][:]
-                    game[cur_garside_len] = game[cur_garside_len][:2] + [min_max_normalized_projlen[id], projlen_across_batch[id]]
+                    game[cur_garside_len] = game[cur_garside_len][:2] + [min_max_normalized_projlen[id], projlens[cur_garside_len-1, id]]
 
                     print ("iterationTrainExamples[game][cur_garside_len]", _[2], game[cur_garside_len][2:], flush=True)
             iterationTrainExamples = [board_pi_v for game in iterationTrainExamples for _, board_pi_v in game.items()]
