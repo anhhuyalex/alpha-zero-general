@@ -56,8 +56,8 @@ argparser.add_argument('--numEps', default=100, type=int)
 argparser.add_argument('--tempThreshold', default=200, type=int)
 argparser.add_argument('--maxlenOfQueue', default=200000, type=int)
 argparser.add_argument('--num_jobs_at_a_time', default=5, type=int)
-argparser.add_argument('--nummaxMCTSSims', default=8, type=int)
-argparser.add_argument('--numminMCTSSims', default=4, type=int)
+argparser.add_argument('--nummaxMCTSSims', default=10, type=int)
+argparser.add_argument('--numminMCTSSims', default=10, type=int)
 argparser.add_argument('--cpuct', default=1.0, type=float)
 argparser.add_argument('--batch_size', default=256, type=int)
 argparser.add_argument('--epochs', default=10, type=int)
@@ -146,15 +146,14 @@ class Self_play:
         projlens = [1]
         action_list = (0,)
         for cur_garside_len in range(self.game.getBoardSize() + 1):
-            if self.game.getGameEnded(cur_garside_len):
-                best_projlen = np.inf
-                # reward is minimum projlen attained after applying the action
-                # print ("trainExamples", len(trainExamples), "projlens", len(projlens), "action_list", len(action_list))
-                for i in range(len(trainExamples) - 1, -1, -1): 
-                    x = trainExamples[i] 
-                    if projlens[x[2]] < best_projlen:
-                        best_projlen = projlens[x[2]]
-                    trainExamples[i] = (x[0], x[1], self.game.transform_normalize_reward(best_projlen)) 
+            # halt if game has ended or if projlen is 1 and cur_garside_len > 0
+            # i.e. found kernel element
+            if self.game.getGameEnded(cur_garside_len) or (projlens[-1] == 1 and cur_garside_len > 0):
+                trainExamples = self.return_trainExamples(trainExamples, projlens) 
+                # print ("trainExamples", trainExamples, len(trainExamples), "projlens", len(projlens), "action_list", len(action_list))
+                # pad projlens to length max_garside_len
+                projlens += [projlens[-1]] * (self.game.getBoardSize() - len(projlens[1:]))
+                
                 return trainExamples, action_list[1:], projlens[1:]
             
             episodeStep += 1
@@ -170,7 +169,7 @@ class Self_play:
                                              apply_Dirichlet_noise = True)
                 sym = self.game.getSymmetries(canonicalBoard, pi)
                 for b, p in sym:
-                    trainExamples.append([b, p, cur_garside_len, None])
+                    trainExamples.append([b, p, cur_garside_len+1])
                 action = np.random.choice(len(pi), p=pi)
             else:
                 # other turns we perform a fast search with a much smaller cap of n < N. Only turns with a
@@ -187,15 +186,21 @@ class Self_play:
                 action_list += (action,)
                 if next_garside_len % 20 == 0: print ("pi", next_garside_len, pi, "action_list", action_list, "projlen", projlen, flush=True)
             except:
-                best_projlen = np.inf
-                # reward is minimum projlen attained after applying the action
-                for i in range(len(trainExamples) - 1, -1, -1): 
-                    x = trainExamples[i] 
-                    if projlens[i+1] < best_projlen:
-                        best_projlen = projlens[i]
-                    trainExamples[i] = (x[0], x[1], self.game.transform_normalize_reward(best_projlen)) 
+                trainExamples = self.return_trainExamples(trainExamples, projlens)
                 return trainExamples, action_list[1:], projlens[1:]
-            
+
+    def return_trainExamples(self, trainExamples, projlens):
+        """
+        This function adds the projlens to the trainExamples
+        returns trainExamples, which is a dictionary of the form
+        {projlen: [board, pi, projlen]}
+        """
+        trainExamples_dict = {}
+        for i in range(len(trainExamples)):
+            x = trainExamples[i] 
+            trainExamples_dict[x[2]] = [x[0], x[1], projlens[x[2]]]
+        return trainExamples_dict
+    
 class BraidGame():
     """
     This class specifies the base Game class. To define your own game, subclass
@@ -285,7 +290,7 @@ class BraidGame():
             # print ("product_matrix_so_far", polymat.trim(board), product_matrix_so_far, product_matrix_so_far.shape, polymat.trim(product_matrix_so_far))
             return self.getCanonicalForm(product_matrix_so_far, None), cur_garside_len + 1, polymat.projlen(product_matrix_so_far)
         except:
-            return self.getCanonicalForm(board, None), 1e3, 1e3
+            return self.getCanonicalForm(board, None), cur_garside_len + 1, polymat.projlen(board) + 4
 
     def transform_normalize_reward(self, projlen):
         """
@@ -451,7 +456,7 @@ class NNetWrapper(NeuralNet.NeuralNet):
         """
         # Convert examples to tensors
         print ("examples", len(examples), len(examples[0]))
-        boards, pis, vs = list(zip(*examples))
+        boards, pis, vs, _ = list(zip(*examples))
         boards = torch.tensor(np.stack(boards))
         pis = torch.tensor(np.stack(pis))
         vs = torch.tensor(np.stack(vs).astype(np.float64)) 
@@ -555,7 +560,8 @@ class MCTS():
         self.game = game
         self.nnet = nnet
         self.args = args 
-        self.Qbias = {i: (-0.04247 *i+2.247) for i in range(args.max_garside_len)} # line from (0,2.247) to (100,-2), function of Qbias with cur_garside_len as parameter
+        # self.Qbias = {i: (-0.04247 *i+2.247) for i in range(args.max_garside_len)} # line from (0,2.247) to (100,-2), function of Qbias with cur_garside_len as parameter
+        self.Qbias = {i: 0 for i in range(args.max_garside_len)} # remove Qbias but keep it in case we need it later
         # since we start off at "really good" states
         self.Qsa = {}  # stores Q values for s,a (as defined in the paper)
         self.Nsa = {}  # stores #times edge s,a was visited
@@ -633,7 +639,7 @@ class MCTS():
         # s = self.game.stringRepresentation(canonicalBoard)
         s = action_list
         last_action = action_list[-1] 
-        print ("executing search on", s, "cur_garside_len", cur_garside_len)
+        print ("executing search on", s, "cur_garside_len", cur_garside_len, "root", root, flush=True)
         if self.game.getGameEnded(cur_garside_len) != 0:
             # terminal node 
             # print ("terminal node", s)
@@ -645,7 +651,7 @@ class MCTS():
 
         if s not in self.Ps:
             # leaf node 
-            print ("s", s, "not in Ps")
+            
             self.Ps[s], self.Es[s] = self.nnet.predict(canonicalBoard)
             # if : print ("Ps", self.Ps[s], "Es", self.Es[s])
             v = self.Es[s] # value of the leaf node
@@ -670,7 +676,7 @@ class MCTS():
 
             self.Vs[s] = valids
             self.Ns[s] = 1
-            
+            print ("s", s, "not in Ps got v", v)
             return v
 
         # print ("s", s, "in Ps")        
@@ -784,28 +790,45 @@ class Coach():
              
             policy = "net"
             iterationTrainExamples = []
-            nummaxMCTSSims = 3*i + self.args.nummaxMCTSSims
-            numminMCTSSims = i + self.args.numminMCTSSims
+            nummaxMCTSSims = 10*i + self.args.nummaxMCTSSims
+            numminMCTSSims = 5*i + self.args.numminMCTSSims
             for j in range(0, self.args.numEps, args.num_jobs_at_a_time):
                 actors = [Self_play.remote(policy, self.game, self.nnet, nummaxMCTSSims, numminMCTSSims, self.args) for _ in range(args.num_jobs_at_a_time)]
                 iterationTrainExamples += ray.get([actor.executeEpisode.remote() for actor in actors])
 
             iterationTrainExamples, action_lists, projlens = zip(*iterationTrainExamples) 
-            # iterationTrainExamples: list of list of examples of the form (canonicalBoard, currPlayer, pi,v)
-            iterationTrainExamples = [item for sublist in iterationTrainExamples for item in sublist]
-            print ("iterationTrainExamples", len(iterationTrainExamples))
-            print ("action_lists", action_lists, flush=True)
-            print ("projlens", projlens, flush=True)
-            for (action_list, projlen) in zip(action_lists, projlens):
-                 
-                for l in range(1, len(action_list)):
-                    if projlen[l] < self.best_projlen_and_seq[l+1][1]:
-                        self.best_projlen_and_seq[l] = [action_list[:l], projlen[l]] 
-                    if projlen[l] == 1:
-                        print ("found kernel", action_list[:l])
+            # for game in iterationTrainExamples:
+            #     for board, pi, proj_len in game:
+            #         print (proj_len)
+            # iterationTrainExamples: list of dict of the form cur_garside_len: (canonicalBoard, currPlayer, pi,v)
             
+            # print ("iterationTrainExamples", len(iterationTrainExamples))
+            # print ("action_lists", action_lists, flush=True)
+            # print ("projlens", np.array(projlens).T, flush=True)
+            projlens = np.array(projlens).T
+            # print ("iterationTrainExamples", [game.keys() for game in iterationTrainExamples] , flush=True)
 
-            print ("self.best_projlen_and_seq", self.best_projlen_and_seq)
+            projlen_across_batch = projlens[-1] # projlens[-1] is the projlen of the last action in the action_list
+            min_max_normalized_projlen = (projlen_across_batch - projlen_across_batch.min()) / (projlen_across_batch.max() - projlen_across_batch.min() + 1e-8) # add 1e-8 to avoid division by zero
+            min_max_normalized_projlen = -(2 * min_max_normalized_projlen - 1) # scale to [-1, 1] and negative projlen since we want to minimize projlen
+            print ("min_max_normalized_projlen", projlen_across_batch, min_max_normalized_projlen, flush=True)
+            for id, game in enumerate(iterationTrainExamples):
+                for cur_garside_len in game:
+                    _ = game[cur_garside_len][:]
+                    game[cur_garside_len] = game[cur_garside_len][:2] + [min_max_normalized_projlen[id], projlen_across_batch[id]]
+
+                    print ("iterationTrainExamples[game][cur_garside_len]", _[2], game[cur_garside_len][2:], flush=True)
+            iterationTrainExamples = [board_pi_v for game in iterationTrainExamples for _, board_pi_v in game.items()]
+
+            
+            # for (action_list, projlen) in zip(action_lists, projlens):
+                 
+            #     for l in range(1, len(action_list)):
+            #         if projlen[l] < self.best_projlen_and_seq[l+1][1]:
+            #             self.best_projlen_and_seq[l] = [action_list[:l], projlen[l]] 
+            #         if projlen[l] == 1:
+            #             print ("found kernel", action_list[:l])
+            # print ("self.best_projlen_and_seq", self.best_projlen_and_seq)
 
             self.saveTrainExamples(iterationTrainExamples, i - 1)
             iterationTrainExamples = self.loadTrainExamples(i - 1)
@@ -820,7 +843,7 @@ class Coach():
             trainExamples = []
             for e in self.trainExamplesHistory:
                 trainExamples.extend(e)
-            print ("trainExamples", len(trainExamples))
+            print ("trainExamples", self.trainExamplesHistory, len(trainExamples))
 
             # training new network, keeping a copy of the old one
             self.nnet.save_checkpoint(folder=self.args.checkpoint, filename='temp.pth.tar')
@@ -829,7 +852,7 @@ class Coach():
             self.logtrainingmetrics(action_lists, projlens, pi_loss, v_loss, i - 1)
 
     def getCheckpointFile(self, iteration):
-        return 'checkpoint_epoch_' + str(iteration) + f'_mod_p_{args.mod_p}'
+        return 'testcheckpoint_epoch_' + str(iteration) + f'_mod_p_{args.mod_p}'
 
     def saveTrainExamples(self, iterationTrainExamples, iteration):
         if args.debug: return
