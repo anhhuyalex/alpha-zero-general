@@ -60,6 +60,7 @@ argparser.add_argument('--nummaxMCTSSims', default=10, type=int)
 argparser.add_argument('--numminMCTSSims', default=10, type=int)
 argparser.add_argument('--cpuct', default=1.0, type=float)
 argparser.add_argument('--batch_size', default=256, type=int)
+argparser.add_argument('--pretrain_epochs', default=1, type=int)
 argparser.add_argument('--epochs', default=10, type=int)
 argparser.add_argument('--pretrain_lr', default=2e-5, type=float)
 argparser.add_argument('--lr', default=6e-5, type=float)
@@ -439,18 +440,21 @@ class NNetWrapper(NeuralNet.NeuralNet):
         print ("pytorch_total_params", pytorch_total_params) 
         self.max_garside_len = game.getBoardSize()
         self.action_size = game.getActionSize()
-
+        self.optimizer = torch.optim.Adam(self.nnet.parameters(), 
+                                    lr=0.1,
+                                    weight_decay=1e-8)
         if args.cuda:
             self.nnet.cuda()
 
     def set_eval_mode(self):
         self.nnet.eval()
 
-    def train(self, examples, policy, lr):
+    def train(self, examples, policy, lr, num_epochs):
         """
         examples: list of examples, each example is of form (board, pi, v)
         policy: "net" or "random"
         lr: learning rate
+        num_epochs: number of epochs
 
         if policy is random, only do value training
         """
@@ -467,11 +471,12 @@ class NNetWrapper(NeuralNet.NeuralNet):
         # Create a data loader
         train_loader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
-        optimizer = torch.optim.Adam(self.nnet.parameters(), 
-                                    lr=lr,
-                                    weight_decay=1e-8)
+        optimizer = self.optimizer
+        # modify lr
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
 
-        for epoch in range(args.epochs):
+        for epoch in range(num_epochs):
             print('EPOCH ::: ' + str(epoch + 1))
             self.nnet.train()
             pi_losses = utils.AverageMeter()
@@ -779,7 +784,7 @@ class Coach():
             for e in self.trainExamplesHistory:
                 trainExamples.extend(e)
             print ("trainExamples", len(trainExamples)) 
-            pi_loss, v_loss = self.nnet.train(trainExamples, policy="net", lr = self.args.pretrain_lr)
+            pi_loss, v_loss = self.nnet.train(trainExamples, policy="net", lr = self.args.pretrain_lr, num_epochs = self.args.pretrain_epochs)
             self.nnet.save_checkpoint(folder=self.args.checkpoint, filename='pretrained.pth.tar')
 
         
@@ -790,8 +795,8 @@ class Coach():
              
             policy = "net"
             iterationTrainExamples = []
-            nummaxMCTSSims = 10*i + self.args.nummaxMCTSSims
-            numminMCTSSims = 5*i + self.args.numminMCTSSims
+            nummaxMCTSSims = 10*(i - 12) + self.args.nummaxMCTSSims
+            numminMCTSSims = 5*(i - 12) + self.args.numminMCTSSims
             for j in range(0, self.args.numEps, args.num_jobs_at_a_time):
                 actors = [Self_play.remote(policy, self.game, self.nnet, nummaxMCTSSims, numminMCTSSims, self.args) for _ in range(args.num_jobs_at_a_time)]
                 iterationTrainExamples += ray.get([actor.executeEpisode.remote() for actor in actors])
@@ -847,7 +852,7 @@ class Coach():
 
             # training new network, keeping a copy of the old one
             self.nnet.save_checkpoint(folder=self.args.checkpoint, filename='temp.pth.tar')
-            pi_loss, v_loss = self.nnet.train(trainExamples, policy=policy, lr = self.args.lr) 
+            pi_loss, v_loss = self.nnet.train(trainExamples, policy=policy, lr = self.args.lr, num_epochs = self.args.epochs)
 
             self.logtrainingmetrics(action_lists, projlens, pi_loss, v_loss, i - 1)
 
